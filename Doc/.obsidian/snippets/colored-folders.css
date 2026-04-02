@@ -1,0 +1,30 @@
+/* Base style for the "Pill" look */
+.nav-folder-title {
+    margin: 4px 8px;
+    padding: 6px 12px !important;
+    border-radius: 8px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+
+/* Specific Folder Colors (Change 'Intelligence' to your folder name) */
+.nav-folder-title[data-path="Intelligence"] {
+    background-color: #d1e2c4 !important; /* Soft Green */
+    color: #2e3d26 !important;
+}
+
+.nav-folder-title[data-path="Projects"] {
+    background-color: #bcd9ea !important; /* Soft Blue */
+    color: #2a3d4a !important;
+}
+
+.nav-folder-title[data-path="Tasks"] {
+    background-color: #f5d1d1 !important; /* Soft Red/Pink */
+    color: #4a2a2a !important;
+}
+
+/* Hover effect to make it feel interactive */
+.nav-folder-title:hover {
+    filter: brightness(0.9);
+    cursor: pointer;
+}
