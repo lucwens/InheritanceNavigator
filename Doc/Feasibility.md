@@ -21,115 +21,132 @@ InheritanceNavigator is a proposed Visual Studio extension that provides a docka
 
 ---
 
-## 2. Technical Feasibility
+## 2. Executive Summary
 
-### 2.1 Overall Assessment: FEASIBLE
+InheritanceNavigator is **technically feasible**. The core challenge — reliably parsing C++ inheritance hierarchies and virtual function override chains — can be solved through multiple approaches, each with distinct trade-offs. Visual Studio's extensibility model for tool windows and file navigation is mature and well-documented. The VS 2022 to VS 2026 compatibility story is favorable, with Microsoft's API-version-based model meaning a single extension binary can target both versions. The project carries **moderate technical risk**, concentrated almost entirely in the C++ parsing layer.
 
-The project is technically feasible. All required capabilities have precedents in existing Visual Studio extensions. However, the **C++ code analysis component** is the most challenging aspect and will require careful technology selection.
+---
 
-### 2.2 Component Analysis
+## 3. Technical Feasibility
 
-#### A. Visual Studio Extension Framework — Low Risk
+### 3.1 C++ Code Analysis — The Central Challenge
+
+The extension needs to extract four pieces of information from a C++ codebase:
+1. Class declarations and their names
+2. Inheritance relationships (which class derives from which)
+3. Virtual function declarations per class
+4. Override relationships (which derived classes override which virtual functions) and the source locations of those **implementations** (not declarations)
+
+C++ is notoriously difficult to parse. Unlike C# (where Roslyn provides a complete semantic model), there is no single, universally reliable, easy-to-integrate C++ parser for the .NET ecosystem. Five approaches were evaluated:
+
+### 3.2 Approach Comparison
+
+| Approach | Accuracy | Integration | Maintenance | Complexity | Verdict |
+|----------|----------|-------------|-------------|------------|---------|
+| ClangSharp / libclang | High | Medium | Medium | High | **Recommended** |
+| VCCodeModel (DTE) | Medium | Excellent | Low | Low | Fallback |
+| VS IntelliSense DB | High | Good | High | Medium | Too fragile |
+| ctags / Universal Ctags | Low | Poor | Low | Low | Insufficient |
+| Tree-sitter | Low | Poor | Medium | Medium | Insufficient |
+
+#### Approach A: ClangSharp / libclang (Recommended)
+
+[ClangSharp](https://github.com/dotnet/ClangSharp) provides .NET bindings to libclang, the stable C interface to Clang's AST. The extension would parse each translation unit, walk the AST to find class declarations, base specifiers, and method cursors, and use `clang_getOverriddenCursors()` to build override chains. ClangSharp.Interop (v21.x, January 2026) tracks LLVM 21 and is actively maintained under the `dotnet` GitHub organization.
+
+- *Pros:*
+  - Full semantic understanding of C++ (templates, multiple inheritance, virtual inheritance, SFINAE, macros)
+  - Dedicated `clang_getOverriddenCursors()` API designed exactly for this use case
+  - Provides precise source locations for both declarations and definitions via `clang_getCursorDefinition()`
+  - Actively maintained, NuGet-distributable, works from C#
+  - Independent of Visual Studio's internal C++ engine — works even if VS IntelliSense is broken or still loading
+- *Cons:*
+  - Requires compilation flags (include paths, defines, language standard) for each translation unit to parse correctly
+  - Distributing libclang native binaries adds ~30-50 MB to the VSIX package
+  - Parsing an entire large codebase from scratch can be slow (minutes for 100k+ LOC projects)
+  - May disagree with MSVC on edge cases (MSVC extensions, non-standard code)
+- *Viability:* **HIGH.** This is the most technically sound approach. The main integration challenge is obtaining compilation flags from the VS project system.
+
+#### Approach B: VCCodeModel (Visual Studio's Built-in C++ Code Model)
+
+Visual Studio exposes a `VCCodeModel` interface that provides access to C++ code elements parsed by VS's own IntelliSense engine.
+
+- *Pros:* Zero additional parsing infrastructure, no native binaries to distribute, automatically has the correct compilation context
+- *Cons:* VCCodeModel is a legacy, heuristic-based API. Microsoft has stated that type strings "are coming directly from source code" and "are no longer resolved by the compiler." It may not correctly resolve inheritance through typedefs, templates, or macros. It does not reliably distinguish between declarations and definitions. Limited documentation; the most detailed blog post is from 2010.
+- *Viability:* **MEDIUM.** Works for simple hierarchies but may produce incorrect results for complex C++ code.
+
+#### Approach C: VS IntelliSense Browse Database
+
+Query the `.vs/` SQLite database containing parsed symbol information.
+
+- *Pros:* Data already computed by VS. No redundant parsing needed.
+- *Cons:* Schema is undocumented, changes between VS versions, concurrent access issues while VS is running.
+- *Viability:* **LOW.** Too fragile for a production extension that must work across VS versions.
+
+#### Approach D: Universal Ctags
+
+Run ctags externally to generate a tags database, parse for class and function information.
+
+- *Pros:* Very fast, simple to integrate.
+- *Cons:* Purely syntactic — cannot resolve templates, macros, conditional compilation, or override relationships. Cannot locate implementations separately from declarations.
+- *Viability:* **LOW.** Insufficient semantic accuracy for the stated requirements.
+
+#### Approach E: Tree-sitter
+
+Use a Tree-sitter C++ grammar to parse source files into concrete syntax trees.
+
+- *Pros:* Fast incremental parsing, good error recovery.
+- *Cons:* Syntactic only — no semantic analysis. Cannot resolve typedefs, templates, or namespaces. No .NET bindings of production quality.
+- *Viability:* **LOW.** Same fundamental limitation as ctags.
+
+### 3.3 Visual Studio Extension Framework — Low Risk
 
 Creating a dockable tool window in Visual Studio is a well-established pattern. The VS SDK (VSSDK) provides:
 
 - **Tool Window infrastructure** (`ToolWindowPane`) — dockable, floatable, pinnable windows identical to Solution Explorer
-- **WPF-based UI** — full access to WPF for building the filtering/search interface
+- **WPF-based UI** — full access to WPF for building the filtering/search interface with `TreeView`, `ListView`, `TextBox` controls
 - **Command infrastructure** — toolbar buttons, context menus, keyboard shortcuts
 - **Settings/options pages** — for persisting source folder configuration
 
-**Assessment:** Straightforward. Extensive documentation, templates, and samples exist. The `Microsoft.VisualStudio.SDK` NuGet package provides all necessary APIs.
+The [Community.VisualStudio.Toolkit](https://github.com/VsixCommunity/Community.VisualStudio.Toolkit) NuGet package simplifies many VSSDK patterns and is recommended.
 
-#### B. C++ Code Analysis — High Risk (Core Challenge)
+### 3.4 Extension Model Choice
 
-This is the central technical challenge. The extension needs to:
-1. Enumerate all C++ classes within configured source folders
-2. Identify virtual functions for each class
-3. Resolve the full inheritance chain (both up and down) for each virtual function
-4. Map each override to its source file and implementation location
+| Aspect | VSSDK (Classic, In-Process) | VisualStudio.Extensibility (New, Out-of-Process) |
+|--------|----------------------------|--------------------------------------------------|
+| Tool Windows | Full WPF support | Remote UI (data binding only, no code-behind) |
+| File Navigation | `IVsTextManager.NavigateToLineAndColumn` | Limited, still evolving |
+| C++ Code Model Access | `VCCodeModel` via COM | Not available |
+| Project System Access | Full DTE/IVsHierarchy | Project Query API (limited) |
+| VS 2022 + VS 2026 | Yes (single binary) | VS 2022 17.9+ and VS 2026 |
 
-**Five approaches were evaluated:**
+**Recommendation:** Use **VSSDK (classic in-process)** for this extension. The requirement to access the C++ project system for compilation flags, create a rich interactive tool window, and navigate to specific source locations all favor the mature VSSDK model.
 
-| Approach | Accuracy | Integration | Maintenance | Complexity |
-|----------|----------|-------------|-------------|------------|
-| VS Code Model (DTE) | Medium | Excellent | Low | Low |
-| libclang / ClangSharp | High | Poor | Medium | High |
-| VS IntelliSense DB | High | Good | High | Medium |
-| IVsLanguageService | Medium-High | Good | Medium | Medium |
-| ctags | Low | Poor | Low | Low |
+### 3.5 VS 2022 / VS 2026 Compatibility — Low Risk
 
-**Approach 1: Visual Studio Code Model (EnvDTE)**
+Microsoft's API-version-based compatibility model means a VSIX targeting `[17.0,)` will load in both VS 2022 and VS 2026 without modification. Both versions are 64-bit and share the same SDK surface.
 
-The `EnvDTE.CodeModel` and `EnvDTE80.CodeModel2` APIs provide access to the code structure of a project as Visual Studio understands it.
+### 3.6 Source File Navigation — Low Risk
 
-- *Pros:* Fully integrated, no external dependencies, works with whatever parser VS uses internally, respects project configuration (include paths, defines)
-- *Cons:* The C++ code model has historically been less complete than the C# one. `CodeClass.Bases` and `CodeClass.DerivedTypes` properties may not fully resolve complex template hierarchies. The `virtual` and `override` qualifiers may require inspecting `CodeFunction.FunctionKind` or parsing attributes manually
-- *Viability:* Good starting point. Sufficient for most real-world C++ codebases that use straightforward inheritance
-
-**Approach 2: libclang / ClangSharp**
-
-Use LLVM's libclang through the ClangSharp C# bindings to parse C++ translation units into a full AST.
-
-- *Pros:* Full, accurate C++ parsing including templates, multiple inheritance, virtual specifiers, override attributes. Industry-standard C++ parser
-- *Cons:* Requires a compilation database (`compile_commands.json`) or manual configuration of include paths and defines. Adds a significant external dependency (~50MB+). Parsing large codebases can be slow. May disagree with MSVC on edge cases (MSVC extensions, non-standard code)
-- *Viability:* Most accurate option, but heaviest integration burden
-
-**Approach 3: VS IntelliSense Browse Database**
-
-Visual Studio maintains a SQLite database (in the `.vs/` folder) containing parsed symbol information used by IntelliSense, Go to Definition, and Find All References.
-
-- *Pros:* Data is already computed by VS during normal operation. Contains class hierarchies, function signatures, and source locations. No redundant parsing needed
-- *Cons:* The database schema is undocumented and internal to VS. It changes between VS versions (a concern for VS 2022 + 2026 support). Accessing it requires reverse-engineering or using undocumented APIs. Concurrent access while VS is running may cause locking issues
-- *Viability:* Potentially very efficient, but fragile and risky due to undocumented internals
-
-**Approach 4: IVsLanguageService / Language Server Protocol**
-
-Use Visual Studio's language service interfaces to query semantic information about C++ code.
-
-- *Pros:* Official VS API surface, better maintained than raw DTE CodeModel. Can leverage whatever parsing engine VS uses (EDG-based for MSVC). Supports Find All References and Go to Definition semantics
-- *Cons:* The C++ language service APIs are less documented than C#/VB equivalents. May require experimentation to find the right interfaces. API surface may change between VS versions
-- *Viability:* Good middle ground between DTE simplicity and libclang accuracy
-
-**Approach 5: Universal Ctags**
-
-Run ctags externally to generate a tags file, then parse it for class and function information.
-
-- *Pros:* Simple, fast, language-agnostic, no VS API dependency for parsing
-- *Cons:* Poor accuracy for C++ — does not reliably resolve templates, namespaces, multiple inheritance, or virtual/override semantics. Would miss many real-world patterns
-- *Viability:* Not recommended as primary approach. Accuracy is insufficient for the stated requirements
-
-#### C. Source Folder Filtering — Low Risk
-
-Filtering classes by source folder is straightforward regardless of the code analysis approach chosen. All approaches provide source file location information, which can be matched against configured folder paths.
-
-#### D. Search/Filter UI — Low Risk
-
-Text fragment matching on class names and function names is a standard UI pattern. WPF provides `CollectionViewSource` with filtering, or a simple LINQ-based filter on the backing data. Debounced text input with filtered list display is well-established.
-
-#### E. Source File Navigation — Low Risk
-
-Visual Studio provides multiple APIs for navigating to code locations:
-- `DTE.ItemOperations.OpenFile()` + `TextSelection.GotoLine()`
-- `IVsTextManager.NavigateToLineAndColumn()`
-- `IVsCodeWindow` interfaces
-
-Navigating to implementations (not declarations) is slightly more complex — it requires resolving which file contains the function body, not just the declaration. The code analysis approach chosen will determine how this information is obtained.
+When using ClangSharp, both declaration and definition locations are available from the AST via `clang_getCursorDefinition()`. The extension stores the file path, line, and column of each function definition, then uses `IVsTextManager.NavigateToLineAndColumn()` to open and scroll to the exact location.
 
 ---
 
-## 3. Recommended Approach
+## 4. Recommended Architecture
 
-### Primary: Visual Studio Code Model (DTE) + IVsLanguageService
+### Primary: ClangSharp / libclang
 
-Start with the DTE Code Model as the foundation. It provides the simplest integration path and handles the majority of C++ inheritance patterns correctly. Supplement with `IVsLanguageService` APIs where the Code Model falls short (e.g., distinguishing virtual vs. override, resolving implementation locations).
+ClangSharp is the only approach that provides the semantic accuracy required by the specification — particularly for the requirement to navigate to function **implementations** (not declarations), and for accurately resolving override chains through templates and complex inheritance.
 
-### Fallback consideration: libclang
+### Compilation flag acquisition
 
-If the DTE Code Model proves insufficient for the target codebases (e.g., heavy template metaprogramming, complex multiple inheritance), libclang via ClangSharp can be introduced as an alternative analysis backend. This should be treated as a Phase 2 enhancement, not part of the initial implementation.
+The key integration challenge is obtaining compilation flags for libclang. This can be solved by:
+1. Extracting compiler flags from the VS project system via `VCProject` / `VCConfiguration` / `VCCLCompilerTool` interfaces
+2. Reading `compile_commands.json` if present (common in CMake projects)
+3. Allowing manual configuration of include paths and defines in the extension's settings
 
-### Architecture recommendation
+### Architecture
 
-Design the code analysis layer behind an interface (`IInheritanceAnalyzer`) so the parsing backend can be swapped or augmented without changing the UI layer:
+Design the code analysis layer behind an interface so the parsing backend can be swapped or augmented without changing the UI layer:
 
 ```
 UI Layer (WPF Tool Window)
@@ -137,75 +154,117 @@ UI Layer (WPF Tool Window)
     ▼
 IInheritanceAnalyzer (interface)
     │
-    ├── DteInheritanceAnalyzer (Phase 1)
-    └── ClangInheritanceAnalyzer (Phase 2, if needed)
+    ├── ClangInheritanceAnalyzer (primary)
+    └── DteInheritanceAnalyzer (lightweight fallback, if needed)
 ```
 
 ---
 
-## 4. Key Risks and Mitigations
+## 5. Key Risks and Mitigations
 
 | Risk | Severity | Likelihood | Mitigation |
 |------|----------|------------|------------|
-| DTE Code Model insufficient for C++ virtual/override detection | High | Medium | Prototype early with real target codebase. Have libclang as fallback plan |
-| VS 2022 vs 2026 API incompatibilities | Medium | Medium | Use the lowest common API surface. Test on both versions early. Consider separate VSIX targets if needed |
-| Performance with large codebases (10K+ classes) | Medium | Medium | Cache analysis results. Use background threading. Only re-analyze changed files. Limit scope via folder filtering |
-| Finding function implementations (not declarations) | Medium | Low | DTE provides `CodeFunction.StartPoint` which points to the definition. For header-only code, declaration = implementation |
-| Extension marketplace / deployment complexity | Low | Low | Standard VSIX packaging. Well-documented process |
-| Concurrent access to VS internals from extension | Medium | Low | Use VS threading model (`JoinableTaskFactory`). All VS API calls on the UI thread or via proper async patterns |
+| **Compilation flag acquisition** — ClangSharp requires accurate flags to parse correctly | High | Medium | Extract from VS project properties (`VCCLCompilerTool`). Support `compile_commands.json`. Allow manual override. Degrade gracefully with warnings. |
+| **Performance on large codebases** — full libclang parsing can take minutes | High | Medium | Background threading. Cache index to disk. Re-parse only changed files. Use `CXTranslationUnit_SkipFunctionBodies` flag. Scope reduction via folder filtering. Progress indicator. |
+| **VSIX package size** — libclang adds 30-50 MB | Medium | High | Use platform-specific NuGet runtime packages. Acceptable size for a developer tool. |
+| **Complex C++ constructs** — templates, CRTP, virtual inheritance | Medium | Medium | libclang handles these correctly (it is a real compiler frontend). UI must handle multiple inheritance paths and diamond inheritance. |
+| **VS 2022 vs 2026 API differences** | Medium | Low | Target `[17.0,)` for single binary. Test on both versions early. |
+| **Stale index data** as code is edited | Medium | Medium | Listen to `IVsRunningDocTableEvents` for file saves. Provide manual Refresh button. Background re-indexing with debouncing. |
+| **MSVC vs Clang disagreements** on non-standard code | Low | Low | Document known limitations. Most production C++ code compiles on both. |
 
 ---
 
-## 5. Effort Estimation
+## 6. Effort Estimation
 
-| Component | T-shirt Size | Estimated Effort | Notes |
-|-----------|-------------|------------------|-------|
-| VS Extension scaffold + tool window | S | 1-2 days | Project setup, VSIX manifest, empty tool window |
-| Source folder settings UI | S | 1-2 days | Options page, settings persistence, folder picker |
-| Source folder filter checkboxes | S | 1 day | Top-level UI component with enable/disable all |
-| Class enumeration + search | M | 3-5 days | DTE Code Model integration, text fragment filtering |
-| Virtual function enumeration + search | M | 3-5 days | Function listing, virtual/override detection |
-| "Inherited From" view | M | 3-5 days | Walk base class chain, display list, navigation |
-| "Derived From" tree view | L | 5-8 days | Recursive derived class resolution, tree rendering |
-| Navigation to implementations | M | 2-3 days | Open file, scroll to function body |
-| Caching and performance | M | 3-5 days | Background analysis, incremental updates |
-| Testing and polish | M | 3-5 days | Manual testing on real codebases, edge cases |
-| VS 2022 compatibility | S-M | 2-3 days | Conditional compilation or separate targets |
+| Component | Size | Estimated Effort | Notes |
+|-----------|------|------------------|-------|
+| Project scaffolding (VSIX, package, tool window) | S | 1-2 days | Use Community.VisualStudio.Toolkit |
+| Tool window UI (WPF panels, search, tree views) | M | 3-5 days | Standard WPF + MVVM |
+| Source folder configuration (settings, persistence) | S | 1-2 days | VS settings API or custom JSON config |
+| ClangSharp integration (parsing pipeline, AST walking) | L | 5-8 days | Core complexity: classes, bases, virtuals, overrides |
+| Compilation flag extraction (VS project system, JSON) | M | 3-5 days | COM interop with VCProject |
+| Index/cache layer (in-memory model, disk, incremental) | M-L | 4-6 days | Performance-critical; file change detection |
+| Search/filter logic (text fragment matching) | S | 1-2 days | Simple substring matching |
+| "Inherited From" view (ancestor chain) | S | 1-2 days | Walk base class chain upward |
+| "Derived From" tree view (overriding classes) | M | 2-3 days | Recursive tree construction |
+| Double-click navigation | S | 1 day | `IVsTextManager.NavigateToLineAndColumn` |
+| Testing and debugging | L | 5-8 days | Real C++ projects, edge cases |
+| Polish and packaging (icons, marketplace) | S-M | 2-3 days | |
 
-**Total estimated effort: 6-10 weeks** for a single developer, assuming familiarity with VS extensibility. Add 2-4 weeks if this is a first VS extension project (learning curve).
+### Total Estimate
+
+| Scenario | Duration |
+|----------|----------|
+| **Optimistic** (experienced VS extension developer) | 4-6 weeks |
+| **Realistic** (competent C# developer, learning VS extensibility) | 8-12 weeks |
+| **Pessimistic** (significant learning curve on both libclang and VSSDK) | 14-18 weeks |
+
+The ClangSharp integration combined with compilation flag extraction and index caching represents roughly 40-50% of the total effort.
 
 ---
 
-## 6. Dependencies and Prerequisites
+## 7. Dependencies and Prerequisites
 
 ### Required
-- **Visual Studio 2026 SDK** — for extension development and testing
-- **.NET / C#** — VS extensions are written in C#
-- **Microsoft.VisualStudio.SDK** NuGet package — core VS extensibility APIs
-- **A representative C++ codebase** — for testing and validating the analysis accuracy
+- **Visual Studio 2026** with the "Visual Studio extension development" workload
+- **.NET Framework 4.7.2+** (for VSSDK in-process extensions)
+- **Microsoft.VisualStudio.SDK** NuGet package (17.x) — core VSSDK
+- **Community.VisualStudio.Toolkit.17** NuGet package — simplified VSSDK wrapper
+- **ClangSharp.Interop** NuGet package (21.x) — libclang .NET bindings
+- **libclang** NuGet runtime package — native libclang binaries
+- **A representative C++ codebase** — for testing and validating analysis accuracy
 
-### Optional (Phase 2)
-- **ClangSharp** NuGet package — if libclang-based analysis is needed
-- **LLVM/Clang runtime** — required by ClangSharp
+### Optional
+- **CppAst.NET** — higher-level wrapper over ClangSharp if the raw API is too verbose
 
-### Development Environment
-- Visual Studio 2026 with the "Visual Studio extension development" workload installed
-- A test C++ solution with known inheritance hierarchies for validation
+### Knowledge Requirements
+- C# / WPF / MVVM
+- Visual Studio VSSDK extensibility patterns (packages, tool windows, services)
+- libclang API concepts (cursors, translation units, AST traversal)
+- C++ language semantics (inheritance, virtual dispatch, override specifier)
 
 ---
 
-## 7. Conclusion and Recommendation
+## 8. Recommended Development Phases
+
+### Phase 1 — Proof of Concept (2-3 weeks)
+Build a minimal VSIX with a tool window that uses ClangSharp to parse a hardcoded folder, displays a class list, and shows base/derived classes for a selected class. **This validates the core technical risk** (ClangSharp integration within a VS extension).
+
+### Phase 2 — Core Features (4-6 weeks)
+Add virtual function enumeration, override chain resolution, source folder filtering, text search, and double-click navigation. Integrate compilation flag extraction from the VS project system.
+
+### Phase 3 — Robustness (2-4 weeks)
+Add background parsing, disk caching, incremental re-indexing on file changes, progress indicators, error handling for unparseable files, and testing against real-world C++ projects.
+
+### Phase 4 — Polish (1-2 weeks)
+Settings UI, icons, marketplace packaging, documentation, known-limitations list.
+
+---
+
+## 9. Existing Work and References
+
+- [ClangSharp](https://github.com/dotnet/ClangSharp) — the recommended C++ parsing library; maintained under the dotnet GitHub organization
+- [Community.VisualStudio.Toolkit](https://github.com/VsixCommunity/Community.VisualStudio.Toolkit) — recommended VSSDK wrapper with tool window and navigation samples
+- [ClassHierarchyNavigator](https://github.com/csabeszko/ClassHierarchyNavigator) — VS 2022 type hierarchy extension (targets .NET/Roslyn, not C++, but useful architectural reference)
+- [VCCodeModel Interface (Microsoft Learn)](https://learn.microsoft.com/en-us/dotnet/api/microsoft.visualstudio.vccodemodel.vccodemodel?view=visualstudiosdk-2022) — VS built-in C++ code model documentation
+- [VS Extension Compatibility Model](https://devblogs.microsoft.com/visualstudio/modernizing-visual-studio-extension-compatibility-effortless-migration-for-extension-developers-and-users/) — API-version-based compatibility for VS 2022/2026
+- [libclang documentation](https://clang.llvm.org/docs/LibClang.html) — Clang stable C API reference
+- [clang_getOverriddenCursors](https://clang.llvm.org/doxygen/group__CINDEX__CURSOR__MANIP.html) — the key API for resolving override chains
+
+---
+
+## 10. Conclusion
 
 ### Verdict: PROCEED — the project is feasible
 
-The InheritanceNavigator fills a genuine gap in the C++ developer experience within Visual Studio. While VS provides "Go to Definition" and "Find All References," it lacks a dedicated, filtered view of inheritance hierarchies — exactly what this tool provides.
+InheritanceNavigator fills a genuine gap in the C++ developer experience within Visual Studio. While VS provides "Go to Definition" and "Find All References," it lacks a dedicated, filtered view of inheritance hierarchies — exactly what this tool provides.
 
 **Key recommendations:**
 
-1. **Start with a prototype** — Build a minimal VS extension that can enumerate classes and their base classes using the DTE Code Model. Test this against the target codebase within the first week to validate the approach before investing in the full UI
-2. **Use DTE Code Model as the primary analysis engine** — It's the simplest integration path and avoids external dependencies. Only escalate to libclang if DTE proves insufficient
-3. **Design for swappable backends** — Abstract the code analysis behind an interface so the parsing strategy can evolve without rewriting the UI
-4. **Target VS 2026 first** — Get it working on the required platform before investing in VS 2022 back-compatibility
-5. **Test with real-world C++ code early and often** — The feasibility of the DTE approach depends on the specific C++ patterns used in the target codebase. Validate early
+1. **Use ClangSharp as the primary analysis engine** — it is the only approach with sufficient semantic accuracy for C++ virtual function analysis, particularly for navigating to implementations
+2. **Execute Phase 1 first as a time-boxed spike** — if the ClangSharp integration within a VSIX proves unworkable (native binary loading issues, parsing accuracy problems, or unacceptable performance), the project should be re-evaluated before proceeding
+3. **Design for swappable backends** — abstract the code analysis behind an interface so the parsing strategy can evolve without rewriting the UI
+4. **Target VS 2026 first** — get it working on the required platform before investing in VS 2022 back-compatibility
+5. **Test with real-world C++ code early and often** — validate against the actual target codebase during Phase 1
 
-The main uncertainty is the completeness of the DTE Code Model for C++ virtual function analysis. This can be resolved in the first few days of prototyping. All other components (UI, navigation, filtering) are standard VS extension patterns with low technical risk.
+The main risk is concentrated in the ClangSharp integration layer (compilation flag acquisition and performance on large codebases). All other components (UI, navigation, filtering) are standard VS extension patterns with low technical risk. With the phased approach, the critical risks are validated early, keeping overall project risk manageable.
