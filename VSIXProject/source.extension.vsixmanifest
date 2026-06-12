@@ -2,8 +2,8 @@
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
   <Metadata>
     <Identity Id="VSIXProject.1b7fcd20-3feb-4a13-9cc4-06711d5a19d0" Version="1.0" Language="en-US" Publisher="Luc Wens" />
-    <DisplayName>VSIXProject</DisplayName>
-    <Description>Empty VSIX Project.</Description>
+    <DisplayName>Inheritance Navigator</DisplayName>
+    <Description>Navigate C++ class inheritance and virtual-function overrides. Reads a Graphify knowledge graph (graphify-out/graph.json) when one is present in the solution.</Description>
   </Metadata>
   <Installation>
     <InstallationTarget Id="Microsoft.VisualStudio.Community" Version="[17.0, )">

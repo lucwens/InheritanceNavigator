@@ -4,6 +4,15 @@
 
 The InheritanceNavigator tool window is a vertical dockable panel similar to the Solution Explorer. It contains five sections stacked vertically, each with a collapsible header.
 
+### Data Source (top of panel)
+
+Above the five sections is a thin data-source bar with a **“Use Graphify database”** switch and a
+status line. When a [Graphify](https://github.com/safishamsi/graphify) knowledge graph
+(`graphify-out/graph.json`) is found in the solution it is detected automatically, the switch turns
+on, and the panel is populated from the graph. When no database is present the switch is disabled and
+the status line says so. The switch lets the user fall back to the live C++ analysis backend (see
+`Doc/Feasibility.md`), which is not yet implemented. See `Doc/GraphifyIntegration.md` for details.
+
 ### Full Layout Prototype
 
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 920" width="320" height="920" font-family="Segoe UI, sans-serif" font-size="12">

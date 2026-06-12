@@ -2,6 +2,8 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
+using VSIXProject.Commands;
+using VSIXProject.UI;
 using Task = System.Threading.Tasks.Task;
 
 namespace VSIXProject
@@ -25,6 +27,8 @@ namespace VSIXProject
     /// </remarks>
     [PackageRegistration(UseManagedResourcesOnly = true, AllowsBackgroundLoading = true)]
     [Guid(VSIXProjectPackage.PackageGuidString)]
+    [ProvideMenuResource("Menus.ctmenu", 1)]
+    [ProvideToolWindow(typeof(InheritanceNavigatorWindow))]
     public sealed class VSIXProjectPackage : AsyncPackage
     {
         /// <summary>
@@ -46,6 +50,9 @@ namespace VSIXProject
             // When initialized asynchronously, the current thread may be a background thread at this point.
             // Do any initialization that requires the UI thread after switching to the UI thread.
             await this.JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
+
+            // Register the "View > Other Windows > Inheritance Navigator" command.
+            await ShowToolWindowCommand.InitializeAsync(this);
         }
 
         #endregion

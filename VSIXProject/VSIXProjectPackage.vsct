@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CommandTable xmlns="http://schemas.microsoft.com/VisualStudio/2005-10-18/CommandTable" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+
+  <!-- This is the file that defines the actual layout and type of the commands. -->
+
+  <Extern href="stdidcmd.h" />
+  <Extern href="vsshlids.h" />
+
+  <Commands package="guidVSIXProjectPackage">
+
+    <Buttons>
+      <!-- Adds "Inheritance Navigator" to View > Other Windows so the user can open the tool window. -->
+      <Button guid="guidVSIXProjectPackageCmdSet" id="ShowToolWindowCommandId" priority="0x0100" type="Button">
+        <Parent guid="guidSHLMainMenu" id="IDG_VS_WNDO_OTRWNDWS1" />
+        <Strings>
+          <ButtonText>Inheritance Navigator</ButtonText>
+        </Strings>
+      </Button>
+    </Buttons>
+
+  </Commands>
+
+  <Symbols>
+    <!-- Must match VSIXProjectPackage.PackageGuidString. -->
+    <GuidSymbol name="guidVSIXProjectPackage" value="{fc6d5f08-89ec-45a2-8c89-2c645158789b}" />
+
+    <!-- Must match ShowToolWindowCommand.CommandSet / CommandId. -->
+    <GuidSymbol name="guidVSIXProjectPackageCmdSet" value="{b1f7c3a2-9d54-4f8e-bc31-7a2e6d5f0c11}">
+      <IDSymbol name="ShowToolWindowCommandId" value="0x0100" />
+    </GuidSymbol>
+  </Symbols>
+
+</CommandTable>
