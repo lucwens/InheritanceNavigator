@@ -20,11 +20,12 @@ Re-running upload updates existing attachments instead of duplicating them.
 """
 import argparse, base64, hashlib, json, math, os, re, sys, time, xmlrpc.client
 
-VERSION = 3                 # bumped whenever this file changes
+VERSION = 5                 # bumped whenever this file changes
 MEDIA = r"G:\My Drive\C-Tech\Marketing\Websters\Media"
 OUT = "website14-media"
 WEBSITE_ID = 14
 MAXW, QUALITY = 1600, 82
+FORMAT = "webp"             # overridden by 'convert --format jpeg'
 MIN_BYTES = 40_000          # below this the source is a 400px-era thumbnail
 
 # Drive folder -> (output folder, website page, section)
@@ -64,8 +65,12 @@ def slug(name):
 
 # --------------------------------------------------------------------- convert
 
-def convert(media_root):
+def convert(media_root, fmt=None):
     from PIL import Image, ImageOps
+    fmt = (fmt or FORMAT).lower()
+    ext = ".jpg" if fmt in ("jpg", "jpeg") else f".{fmt}"
+    pil_fmt = "JPEG" if fmt in ("jpg", "jpeg") else fmt.upper()
+    mime = "image/jpeg" if fmt in ("jpg", "jpeg") else f"image/{fmt}"
 
     if not os.path.isdir(media_root):
         sys.exit(f"Media folder not found: {media_root}\n"
@@ -103,15 +108,18 @@ def convert(media_root):
             w0, h0 = im.size
             if w0 > MAXW:                          # never upscale
                 im = im.resize((MAXW, round(h0 * MAXW / w0)), Image.LANCZOS)
-            out = os.path.join(dst_dir, f"{folder}-{slug(name)}.webp")
-            im.save(out, "WEBP", quality=QUALITY, method=6)
+            out = os.path.join(dst_dir, f"{folder}-{slug(name)}{ext}")
+            save_kw = {"quality": QUALITY}
+            if pil_fmt == "WEBP":
+                save_kw["method"] = 6
+            im.save(out, pil_fmt, **save_kw)
             manifest.append(dict(source=name, folder=folder,
                                  file=os.path.relpath(out, OUT).replace("\\", "/"),
                                  page=page, section=section,
                                  alt=os.path.splitext(name)[0],
                                  web_px=f"{im.size[0]}x{im.size[1]}",
                                  web_kb=round(os.path.getsize(out) / 1024, 1),
-                                 mimetype="image/webp"))
+                                 mimetype=mime))
             kept += 1
         stats[folder] = (kept, skipped)
         print(f"  {folder:12s} -> {page:20s} {kept:4d} kept, {skipped:3d} skipped")
@@ -253,10 +261,17 @@ def upload(args):
         existing[name] = att_id
         return att_id, "created"
 
+    def verify(att_id):
+        """Odoo only sets checksum once real bytes are stored."""
+        r = rpc("ir.attachment", "read", [att_id],
+                fields=["checksum", "file_size"])[0]
+        return bool(r.get("checksum")) and bool(r.get("file_size"))
+
     def save():
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2, ensure_ascii=False)
 
+    checked = False
     live, missing, done = [], 0, 0
     total = sum(1 for m in manifest
                 if os.path.isfile(os.path.join(OUT, m["file"])))
@@ -275,6 +290,19 @@ def upload(args):
                 m["poster_url"] = f"/web/image/{pid}/{os.path.basename(poster)}"
         else:
             m["url"] = f"/web/image/{att_id}/{name}"
+        if not checked and action in ("created", "updated"):
+            checked = True
+            if not verify(att_id):
+                sys.exit(
+                    f"\nERROR: attachment {att_id} stored no file data "
+                    f"(checksum empty).\n"
+                    f"Odoo accepted the record but dropped the binary, so every "
+                    f"image would be a placeholder\nand the website editor's "
+                    f"media dialog will crash on it.\n"
+                    f"Stopping after one file rather than creating hundreds of "
+                    f"broken records.\n"
+                    f"Run 'check' for details, and 'prune --all --yes' to clear "
+                    f"anything already uploaded.")
         live.append(m)
         done += 1
         print(f"[{done:3d}/{total}] {action:8s} id={att_id:<7d} {m['url']}")
@@ -368,7 +396,8 @@ def cmd_prune(args):
     rows = fetch_website_attachments(rpc)
     ours = local_names()
     doomed = [r for r in rows
-              if r["name"].startswith(our_prefixes()) and r["name"] not in ours]
+              if r["name"].startswith(our_prefixes())
+              and (args.all or r["name"] not in ours)]
     if not doomed:
         print(f"\nNothing to prune - every {WEBSITE_ID} attachment with one of "
               f"our prefixes is still in ./{OUT}/.")
@@ -390,6 +419,50 @@ def cmd_prune(args):
     print(f"\nDeleted {len(doomed)} attachments.")
     print("Any <img> already pasted into a page view that pointed at one of "
           "these is now broken - check snippets.html.")
+
+
+def cmd_check(args):
+    """Read one attachment back and report why /web/image might not serve it."""
+    common = xmlrpc.client.ServerProxy(f"{args.url.rstrip('/')}/xmlrpc/2/common")
+    ver = common.version()
+    rpc = connect(args)
+    print(f"Odoo {ver.get('server_serie')} "
+          f"(protocol {ver.get('protocol_version')})\n")
+
+    dom = [("id", "=", int(args.id))] if args.id else \
+          [("website_id", "=", WEBSITE_ID), ("name", "like", "closure-%")]
+    rows = rpc("ir.attachment", "search_read", dom,
+               fields=["name", "type", "mimetype", "file_size", "checksum",
+                       "res_model", "res_id", "res_field", "public", "url",
+                       "website_id", "store_fname"],
+               limit=1, order="id")
+    if not rows:
+        sys.exit("No matching attachment found.")
+    r = rows[0]
+    for k in ("id", "name", "type", "mimetype", "file_size", "checksum",
+              "res_model", "res_id", "res_field", "public", "url",
+              "website_id", "store_fname"):
+        print(f"  {k:<12} {r.get(k)!r}")
+
+    # does the binary actually round-trip?
+    got = rpc("ir.attachment", "read", [r["id"]], fields=["datas"])[0]["datas"]
+    n = len(base64.b64decode(got)) if got else 0
+    print(f"\n  datas        {n} bytes read back")
+    if n:
+        head = base64.b64decode(got)[:16]
+        is_webp = head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+        print(f"  magic        {head[:12]!r}  -> "
+              f"{'valid WebP' if is_webp else 'NOT a WebP'}")
+
+    print(f"\n  /web/content/{r['id']}/{r['name']}   <- raw bytes, no processing")
+    print(f"  /web/image/{r['id']}/{r['name']}     <- image pipeline")
+    if r["file_size"] and n:
+        print("\nBinary is present and intact. If /web/image shows the "
+              "placeholder but /web/content downloads fine, this Odoo's image "
+              "pipeline is not serving WebP - re-run 'convert' with "
+              "--format jpeg and 'upload --force'.")
+    else:
+        print("\nThe binary did not store. That is the problem, not WebP.")
 
 
 def write_snippets(rows):
@@ -427,6 +500,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("convert", help="read the Drive folder, write WebP + sheets")
     c.add_argument("--media", default=MEDIA, help=f"default: {MEDIA}")
+    c.add_argument("--format", default=FORMAT, choices=["webp", "jpeg", "jpg"],
+                   help="output image format (default webp)")
     u = sub.add_parser("upload", help="create the Odoo attachments")
     for flag in ("url", "db", "user", "api-key"):
         u.add_argument(f"--{flag}", required=True)
@@ -442,15 +517,25 @@ def main():
         for flag in ("url", "db", "user", "api-key"):
             parser.add_argument(f"--{flag}", required=True)
     p.add_argument("--yes", action="store_true", help="actually delete")
+    p.add_argument("--all", action="store_true",
+                   help="delete ALL of ours on the website, not just the "
+                        "ones missing locally")
     p.add_argument("--delay", type=float, default=0.4)
+
+    ck = sub.add_parser("check", help="diagnose one attachment end to end")
+    for flag in ("url", "db", "user", "api-key"):
+        ck.add_argument(f"--{flag}", required=True)
+    ck.add_argument("--id", help="attachment id (default: first closure- one)")
     args = ap.parse_args()
     print(f"ctech_media.py v{VERSION}  ({os.path.abspath(__file__)})\n")
     if args.cmd == "convert":
-        convert(args.media)
+        convert(args.media, args.format)
     elif args.cmd == "list":
         cmd_list(args)
     elif args.cmd == "prune":
         cmd_prune(args)
+    elif args.cmd == "check":
+        cmd_check(args)
     else:
         upload(args)
 
