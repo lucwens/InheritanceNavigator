@@ -20,7 +20,7 @@ Re-running upload updates existing attachments instead of duplicating them.
 """
 import argparse, base64, hashlib, json, math, os, re, sys, time, xmlrpc.client
 
-VERSION = 2                 # bumped whenever this file changes
+VERSION = 3                 # bumped whenever this file changes
 MEDIA = r"G:\My Drive\C-Tech\Marketing\Websters\Media"
 OUT = "website14-media"
 WEBSITE_ID = 14
@@ -290,6 +290,108 @@ def upload(args):
     print(f"Snippets: ./{OUT}/snippets.html")
 
 
+def connect(args):
+    common = xmlrpc.client.ServerProxy(f"{args.url.rstrip('/')}/xmlrpc/2/common")
+    uid = common.authenticate(args.db, args.user, args.api_key, {})
+    if not uid:
+        sys.exit("Authentication failed - check --db, --user and --api-key.")
+    models = xmlrpc.client.ServerProxy(f"{args.url.rstrip('/')}/xmlrpc/2/object")
+
+    def rpc(model, method, *a, **kw):
+        for attempt in range(6):
+            try:
+                return models.execute_kw(args.db, uid, args.api_key,
+                                         model, method, list(a), kw)
+            except xmlrpc.client.ProtocolError as e:
+                if e.errcode != 429 or attempt == 5:
+                    raise
+                wait = min(60, 5 * 2 ** attempt)
+                print(f"  rate-limited, waiting {wait}s ...")
+                time.sleep(wait)
+    print(f"Authenticated as uid {uid}")
+    return rpc
+
+
+def fetch_website_attachments(rpc):
+    rows = rpc("ir.attachment", "search_read",
+               [("website_id", "=", WEBSITE_ID)],
+               fields=["name", "file_size", "mimetype"], order="name")
+    return rows
+
+
+def local_names():
+    """Every filename currently sitting in ./website14-media/."""
+    names = set()
+    for root, _dirs, files in os.walk(OUT):
+        if os.path.basename(root) == "_contact-sheets":
+            continue
+        for f in files:
+            if not f.endswith((".json", ".html")):
+                names.add(f)
+    return names
+
+
+def our_prefixes():
+    return tuple(f"{folder}-" for folder, _p, _s in FOLDERS.values()) \
+           + ("closure-testing-",)
+
+
+def cmd_list(args):
+    rows = fetch_website_attachments(connect(args))
+    ours = local_names()
+    pref = our_prefixes()
+    print(f"\n{len(rows)} attachments on website {WEBSITE_ID}\n")
+    print(f"{'id':<8} {'size':>9}  {'':<3} name")
+    groups, orphans = {}, 0
+    for r in rows:
+        prefix = r["name"].split("-")[0]
+        groups[prefix] = groups.get(prefix, 0) + 1
+        stale = r["name"].startswith(pref) and r["name"] not in ours
+        mark = "  *" if stale else "   "
+        orphans += stale
+        print(f"{r['id']:<8} {r['file_size']/1024:8.1f}K {mark} {r['name']}")
+    print(f"\nby name prefix:")
+    for k, v in sorted(groups.items(), key=lambda kv: -kv[1]):
+        print(f"  {k:<16} {v:4d}")
+    total = sum(r["file_size"] for r in rows)
+    print(f"\ntotal {total/1048576:.1f} MB")
+    if orphans:
+        print(f"{orphans} marked * are ours but no longer in ./{OUT}/ - "
+              f"'prune' would delete them")
+    else:
+        print(f"nothing stale - 'prune' would delete nothing")
+
+
+def cmd_prune(args):
+    """Delete attachments on the website that you removed locally."""
+    rpc = connect(args)
+    rows = fetch_website_attachments(rpc)
+    ours = local_names()
+    doomed = [r for r in rows
+              if r["name"].startswith(our_prefixes()) and r["name"] not in ours]
+    if not doomed:
+        print(f"\nNothing to prune - every {WEBSITE_ID} attachment with one of "
+              f"our prefixes is still in ./{OUT}/.")
+        return
+    size = sum(r["file_size"] for r in doomed)
+    print(f"\n{len(doomed)} attachments on website {WEBSITE_ID} are no longer "
+          f"in ./{OUT}/ ({size/1048576:.1f} MB):\n")
+    for r in doomed:
+        print(f"  {r['id']:<8} {r['name']}")
+    if not args.yes:
+        print(f"\nDry run. Re-run with --yes to delete these {len(doomed)}.")
+        return
+    print()
+    for i in range(0, len(doomed), 50):           # batch, stays under the limiter
+        batch = [r["id"] for r in doomed[i:i+50]]
+        rpc("ir.attachment", "unlink", batch)
+        print(f"  deleted {i+len(batch)}/{len(doomed)}")
+        time.sleep(args.delay)
+    print(f"\nDeleted {len(doomed)} attachments.")
+    print("Any <img> already pasted into a page view that pointed at one of "
+          "these is now broken - check snippets.html.")
+
+
 def write_snippets(rows):
     by = {}
     for m in rows:
@@ -333,10 +435,22 @@ def main():
                         "(default 0.4)")
     u.add_argument("--force", action="store_true",
                    help="re-upload files that are already on website 14")
+
+    l = sub.add_parser("list", help=f"show every attachment on website {WEBSITE_ID}")
+    p = sub.add_parser("prune", help="delete attachments you removed locally")
+    for parser in (l, p):
+        for flag in ("url", "db", "user", "api-key"):
+            parser.add_argument(f"--{flag}", required=True)
+    p.add_argument("--yes", action="store_true", help="actually delete")
+    p.add_argument("--delay", type=float, default=0.4)
     args = ap.parse_args()
     print(f"ctech_media.py v{VERSION}  ({os.path.abspath(__file__)})\n")
     if args.cmd == "convert":
         convert(args.media)
+    elif args.cmd == "list":
+        cmd_list(args)
+    elif args.cmd == "prune":
+        cmd_prune(args)
     else:
         upload(args)
 

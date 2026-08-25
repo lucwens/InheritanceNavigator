@@ -41,6 +41,33 @@ python ctech_media.py upload --delay 1.0 --url ... --db ... --user ... --api-key
 Use `--force` to re-send files that are already up there (after re-converting
 at different settings, say).
 
+## Seeing and undoing what is on the site
+
+```bash
+# every attachment on website 14, grouped by name prefix, with sizes
+python ctech_media.py list --url ... --db ... --user ... --api-key ...
+
+# delete the ones you removed from website14-media/ since uploading
+python ctech_media.py prune --url ... --db ... --user ... --api-key ...        # dry run
+python ctech_media.py prune --yes --url ... --db ... --user ... --api-key ...  # do it
+```
+
+`prune` only ever touches attachments on website 14 whose name starts with one
+of our five folder prefixes (`closure-`, `suspension-`, `robotics-`, `towing-`,
+`structural-`) **and** that are no longer present locally. Anything else on the
+website — logos, snippet images, other people's uploads — is left alone.
+It dry-runs by default and lists exactly what it would remove.
+
+So the workflow if you uploaded too much: delete the unwanted `.webp` files
+from `website14-media/`, then run `prune --yes`.
+
+Deleting an attachment that a page view already points at leaves a broken
+image, so prune before wiring up the snippets, or fix the views afterwards.
+
+The same list exists in Odoo itself: developer mode on, then
+Settings → Technical → Attachments (`/odoo/action-base.action_attachment`).
+Search a prefix, select all, Actions → Delete.
+
 ## What it produces
 
 ```
