@@ -41,6 +41,35 @@ python ctech_media.py upload --delay 1.0 --url ... --db ... --user ... --api-key
 Use `--force` to re-send files that are already up there (after re-converting
 at different settings, say).
 
+## If images come out as placeholders
+
+Some Odoo databases (seen on saas-19.3) accept an `ir.attachment` create over
+XML-RPC but silently discard the `datas` payload: you get a record and an id,
+`checksum` stays empty, `/web/image/<id>` serves the grey camera placeholder,
+and the website editor's media dialog crashes in `_compute_image_src` because
+it does `attachment.checksum[:8]` on `False`.
+
+`upload` now detects this on its first file — it writes with `datas`, reads the
+record back, and if nothing stored it deletes that record and switches to
+`raw` for the whole run, printing a note. If neither method stores anything it
+aborts having left nothing behind.
+
+Two commands for looking into it by hand:
+
+```bash
+# create 5 throwaway attachments by different methods, report which stick,
+# then delete them all
+python ctech_media.py probe --url ... --db ... --user ... --api-key ...
+
+# dump one real attachment: checksum, file_size, store_fname, datas round-trip
+python ctech_media.py check --url ... --db ... --user ... --api-key ... [--id 12877]
+```
+
+`/web/content/<id>/<name>` serves raw bytes and skips image processing, so
+comparing it against `/web/image/<id>/<name>` separates "the bytes are
+missing" from "the bytes are fine but this Odoo will not serve that format".
+For the latter, `convert --format jpeg` then `upload --force`.
+
 ## Seeing and undoing what is on the site
 
 ```bash

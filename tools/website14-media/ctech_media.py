@@ -20,7 +20,7 @@ Re-running upload updates existing attachments instead of duplicating them.
 """
 import argparse, base64, hashlib, json, math, os, re, sys, time, xmlrpc.client
 
-VERSION = 5                 # bumped whenever this file changes
+VERSION = 7                 # bumped whenever this file changes
 MEDIA = r"G:\My Drive\C-Tech\Marketing\Websters\Media"
 OUT = "website14-media"
 WEBSITE_ID = 14
@@ -242,18 +242,58 @@ def upload(args):
                     [("website_id", "=", WEBSITE_ID)], fields=["name"])}
     print(f"{len(existing)} attachments already on website {WEBSITE_ID}\n")
 
+    # Odoo saas-19.3 silently drops `datas` sent over XML-RPC on some
+    # databases: the record is created, the bytes are not stored, checksum
+    # stays empty and every /web/image serves a placeholder. Detect on the
+    # first file which of the two write methods this database honours.
+    state = {"method": None}
+
+    def build(rel_path, mimetype, method):
+        data = open(os.path.join(OUT, rel_path), "rb").read()
+        vals = {"name": os.path.basename(rel_path),
+                "mimetype": mimetype,
+                "res_model": "ir.ui.view",
+                "public": True,
+                "website_id": WEBSITE_ID}
+        if method == "datas":
+            vals["datas"] = base64.b64encode(data).decode()
+        else:
+            vals["raw"] = xmlrpc.client.Binary(data)
+        return vals, len(data)
+
+    def stored(att_id):
+        r = rpc("ir.attachment", "read", [att_id],
+                fields=["checksum", "file_size"])[0]
+        return bool(r.get("checksum")) and bool(r.get("file_size"))
+
+    def detect(rel_path, mimetype):
+        """Create the first attachment, trying each method until one sticks."""
+        for method in ("datas", "raw"):
+            vals, _n = build(rel_path, mimetype, method)
+            att = rpc("ir.attachment", "create", vals)
+            if stored(att):
+                if method != "datas":
+                    print(f"note: this database ignores 'datas' over XML-RPC; "
+                          f"using 'raw' instead\n")
+                state["method"] = method
+                return att
+            rpc("ir.attachment", "unlink", [att])
+        sys.exit(
+            "\nERROR: this Odoo stored no file data for either write method.\n"
+            "Neither 'datas' nor 'raw' produced a checksum, so every image "
+            "would be a placeholder.\n"
+            "Nothing was left behind - run 'probe' for the full picture.")
+
     def put(rel_path, mimetype):
         """Create/update one attachment. Returns (id, action)."""
         name = os.path.basename(rel_path)
         if name in existing and not args.force:
             return existing[name], "skipped"
-        vals = {"name": name,
-                "datas": base64.b64encode(
-                    open(os.path.join(OUT, rel_path), "rb").read()).decode(),
-                "mimetype": mimetype,
-                "res_model": "ir.ui.view",
-                "public": True,
-                "website_id": WEBSITE_ID}
+        if state["method"] is None and name not in existing:
+            att_id = detect(rel_path, mimetype)
+            existing[name] = att_id
+            return att_id, "created"
+        vals, _n = build(rel_path, mimetype, state["method"] or "datas")
         if name in existing:
             rpc("ir.attachment", "write", [existing[name]], vals)
             return existing[name], "updated"
@@ -261,17 +301,10 @@ def upload(args):
         existing[name] = att_id
         return att_id, "created"
 
-    def verify(att_id):
-        """Odoo only sets checksum once real bytes are stored."""
-        r = rpc("ir.attachment", "read", [att_id],
-                fields=["checksum", "file_size"])[0]
-        return bool(r.get("checksum")) and bool(r.get("file_size"))
-
     def save():
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2, ensure_ascii=False)
 
-    checked = False
     live, missing, done = [], 0, 0
     total = sum(1 for m in manifest
                 if os.path.isfile(os.path.join(OUT, m["file"])))
@@ -290,19 +323,6 @@ def upload(args):
                 m["poster_url"] = f"/web/image/{pid}/{os.path.basename(poster)}"
         else:
             m["url"] = f"/web/image/{att_id}/{name}"
-        if not checked and action in ("created", "updated"):
-            checked = True
-            if not verify(att_id):
-                sys.exit(
-                    f"\nERROR: attachment {att_id} stored no file data "
-                    f"(checksum empty).\n"
-                    f"Odoo accepted the record but dropped the binary, so every "
-                    f"image would be a placeholder\nand the website editor's "
-                    f"media dialog will crash on it.\n"
-                    f"Stopping after one file rather than creating hundreds of "
-                    f"broken records.\n"
-                    f"Run 'check' for details, and 'prune --all --yes' to clear "
-                    f"anything already uploaded.")
         live.append(m)
         done += 1
         print(f"[{done:3d}/{total}] {action:8s} id={att_id:<7d} {m['url']}")
@@ -465,6 +485,73 @@ def cmd_check(args):
         print("\nThe binary did not store. That is the problem, not WebP.")
 
 
+def cmd_probe(args):
+    """Find which write method actually stores bytes on this Odoo."""
+    from PIL import Image
+    import io as _io
+
+    def blob(fmt):
+        buf = _io.BytesIO()
+        Image.new("RGB", (16, 16), (200, 30, 30)).save(buf, fmt)
+        return buf.getvalue()
+
+    png, webp = blob("PNG"), blob("WEBP")
+    rpc = connect(args)
+    print(f"test blobs: png {len(png)}B, webp {len(webp)}B\n")
+
+    methods = [
+        ("datas= base64 str, image/webp", "image/webp",
+         {"datas": base64.b64encode(webp).decode()}, len(webp)),
+        ("datas= base64 str, image/png ", "image/png",
+         {"datas": base64.b64encode(png).decode()}, len(png)),
+        ("raw=   xmlrpc Binary, webp   ", "image/webp",
+         {"raw": xmlrpc.client.Binary(webp)}, len(webp)),
+        ("raw=   xmlrpc Binary, png    ", "image/png",
+         {"raw": xmlrpc.client.Binary(png)}, len(png)),
+        ("datas, no res_model/public   ", "image/webp",
+         {"datas": base64.b64encode(webp).decode(), "_bare": True}, len(webp)),
+    ]
+
+    made, winners = [], []
+    print(f"{'method':<32} {'checksum':<10} {'file_size':>9}  verdict")
+    print("-" * 70)
+    for label, mime, extra, expect in methods:
+        bare = extra.pop("_bare", False)
+        vals = {"name": f"_probe_{len(made)}_{int(expect)}",
+                "mimetype": mime, **extra}
+        if not bare:
+            vals.update({"res_model": "ir.ui.view", "public": True,
+                         "website_id": WEBSITE_ID})
+        try:
+            att = rpc("ir.attachment", "create", vals)
+        except Exception as e:
+            print(f"{label:<32} {'-':<10} {'-':>9}  create failed: "
+                  f"{str(e).splitlines()[-1][:40]}")
+            continue
+        made.append(att)
+        r = rpc("ir.attachment", "read", [att],
+                fields=["checksum", "file_size"])[0]
+        ck = (r.get("checksum") or "")[:8] or "EMPTY"
+        ok = bool(r.get("checksum")) and r.get("file_size") == expect
+        if ok:
+            winners.append(label.strip())
+        print(f"{label:<32} {ck:<10} {r.get('file_size'):>9}  "
+              f"{'OK' if ok else 'NOT STORED'}")
+
+    if made:
+        rpc("ir.attachment", "unlink", made)
+        print(f"\ncleaned up {len(made)} probe attachments")
+    print()
+    if winners:
+        print("Working method(s):")
+        for w in winners:
+            print(f"  {w}")
+    else:
+        print("Nothing stored. The database is rejecting attachment binaries "
+              "from XML-RPC entirely -\nlikely a permission or storage setting "
+              "on this Odoo Online instance.")
+
+
 def write_snippets(rows):
     by = {}
     for m in rows:
@@ -526,6 +613,11 @@ def main():
     for flag in ("url", "db", "user", "api-key"):
         ck.add_argument(f"--{flag}", required=True)
     ck.add_argument("--id", help="attachment id (default: first closure- one)")
+
+    pr = sub.add_parser("probe",
+                        help="find which write method this Odoo accepts")
+    for flag in ("url", "db", "user", "api-key"):
+        pr.add_argument(f"--{flag}", required=True)
     args = ap.parse_args()
     print(f"ctech_media.py v{VERSION}  ({os.path.abspath(__file__)})\n")
     if args.cmd == "convert":
@@ -536,6 +628,8 @@ def main():
         cmd_prune(args)
     elif args.cmd == "check":
         cmd_check(args)
+    elif args.cmd == "probe":
+        cmd_probe(args)
     else:
         upload(args)
 
