@@ -20,6 +20,7 @@ Re-running upload updates existing attachments instead of duplicating them.
 """
 import argparse, base64, hashlib, json, math, os, re, sys, time, xmlrpc.client
 
+VERSION = 2                 # bumped whenever this file changes
 MEDIA = r"G:\My Drive\C-Tech\Marketing\Websters\Media"
 OUT = "website14-media"
 WEBSITE_ID = 14
@@ -333,6 +334,7 @@ def main():
     u.add_argument("--force", action="store_true",
                    help="re-upload files that are already on website 14")
     args = ap.parse_args()
+    print(f"ctech_media.py v{VERSION}  ({os.path.abspath(__file__)})\n")
     if args.cmd == "convert":
         convert(args.media)
     else:
