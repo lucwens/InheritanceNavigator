@@ -25,9 +25,21 @@ python ctech_media.py upload --url https://<you>.odoo.com \
 
 If your Drive letter differs: `python ctech_media.py convert --media "D:\...\Media"`.
 
-`upload` is idempotent — re-running updates the existing attachments on
-website 14 rather than creating duplicates. Files you deleted in step 2 are
-skipped automatically.
+`upload` is safe to re-run: it fetches the names already on website 14 in one
+call, skips those, and only sends what is new — so an interrupted run just
+picks up where it stopped. Files you deleted in step 2 are skipped too.
+`manifest.json` is flushed every 10 uploads, so a crash never loses progress.
+
+Odoo Online rate-limits XML-RPC. The script sends one write per file, pauses
+`--delay` seconds (0.4 by default) between them, and backs off and retries on
+a 429. Raise the delay if you still get throttled:
+
+```bash
+python ctech_media.py upload --delay 1.0 --url ... --db ... --user ... --api-key ...
+```
+
+Use `--force` to re-send files that are already up there (after re-converting
+at different settings, say).
 
 ## What it produces
 

@@ -18,7 +18,7 @@ web-sized WebP, then creates the Odoo attachments and emits the <img> snippets.
 
 Re-running upload updates existing attachments instead of duplicating them.
 """
-import argparse, base64, hashlib, json, math, os, re, sys, xmlrpc.client
+import argparse, base64, hashlib, json, math, os, re, sys, time, xmlrpc.client
 
 MEDIA = r"G:\My Drive\C-Tech\Marketing\Websters\Media"
 OUT = "website14-media"
@@ -212,55 +212,77 @@ def upload(args):
     if not uid:
         sys.exit("Authentication failed - check --db, --user and --api-key.")
     models = xmlrpc.client.ServerProxy(f"{args.url.rstrip('/')}/xmlrpc/2/object")
-    print(f"Authenticated as uid {uid}\n")
+    print(f"Authenticated as uid {uid}")
+
+    def rpc(model, method, *a, **kw):
+        """One RPC, retried with backoff when Odoo rate-limits us."""
+        for attempt in range(6):
+            try:
+                return models.execute_kw(args.db, uid, args.api_key,
+                                         model, method, list(a), kw)
+            except xmlrpc.client.ProtocolError as e:
+                if e.errcode != 429 or attempt == 5:
+                    raise
+                wait = min(60, 5 * 2 ** attempt)
+                print(f"  rate-limited, waiting {wait}s ...")
+                time.sleep(wait)
+
+    # One call instead of a search per file: what is already on website 14.
+    existing = {r["name"]: r["id"] for r in
+                rpc("ir.attachment", "search_read",
+                    [("website_id", "=", WEBSITE_ID)], fields=["name"])}
+    print(f"{len(existing)} attachments already on website {WEBSITE_ID}\n")
 
     def put(rel_path, mimetype):
-        """Create or update one ir.attachment; return (id, checksum, action)."""
-        full = os.path.join(OUT, rel_path)
+        """Create/update one attachment. Returns (id, action)."""
         name = os.path.basename(rel_path)
+        if name in existing and not args.force:
+            return existing[name], "skipped"
         vals = {"name": name,
-                "datas": base64.b64encode(open(full, "rb").read()).decode(),
+                "datas": base64.b64encode(
+                    open(os.path.join(OUT, rel_path), "rb").read()).decode(),
                 "mimetype": mimetype,
                 "res_model": "ir.ui.view",
                 "public": True,
                 "website_id": WEBSITE_ID}
-        found = models.execute_kw(args.db, uid, args.api_key, "ir.attachment",
-                                  "search", [[("name", "=", name),
-                                              ("website_id", "=", WEBSITE_ID)]],
-                                  {"limit": 1})
-        if found:
-            models.execute_kw(args.db, uid, args.api_key, "ir.attachment",
-                              "write", [found, vals])
-            att_id, action = found[0], "updated"
-        else:
-            att_id = models.execute_kw(args.db, uid, args.api_key,
-                                       "ir.attachment", "create", [vals])
-            action = "created"
-        rec = models.execute_kw(args.db, uid, args.api_key, "ir.attachment",
-                                "read", [[att_id]], {"fields": ["checksum"]})[0]
-        return att_id, (rec.get("checksum") or "")[:7], action
+        if name in existing:
+            rpc("ir.attachment", "write", [existing[name]], vals)
+            return existing[name], "updated"
+        att_id = rpc("ir.attachment", "create", vals)
+        existing[name] = att_id
+        return att_id, "created"
 
-    live, missing = [], 0
+    def save():
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2, ensure_ascii=False)
+
+    live, missing, done = [], 0, 0
+    total = sum(1 for m in manifest
+                if os.path.isfile(os.path.join(OUT, m["file"])))
     for m in manifest:
         if not os.path.isfile(os.path.join(OUT, m["file"])):
-            missing += 1                      # you deleted it while pruning
+            missing += 1                      # deleted while pruning
             continue
-        att_id, csum, action = put(m["file"], m["mimetype"])
+        att_id, action = put(m["file"], m["mimetype"])
         name = os.path.basename(m["file"])
         m["attachment_id"] = att_id
         if m.get("kind") == "video":
             m["url"] = f"/web/content/{att_id}/{name}"
-            if m.get("poster_file") and os.path.isfile(os.path.join(OUT, m["poster_file"])):
-                pid, pcsum, _ = put(m["poster_file"], "image/webp")
-                m["poster_url"] = (f"/web/image/{pid}-{pcsum}/"
-                                   f"{os.path.basename(m['poster_file'])}")
+            poster = m.get("poster_file")
+            if poster and os.path.isfile(os.path.join(OUT, poster)):
+                pid, _ = put(poster, "image/webp")
+                m["poster_url"] = f"/web/image/{pid}/{os.path.basename(poster)}"
         else:
-            m["url"] = f"/web/image/{att_id}-{csum}/{name}"
+            m["url"] = f"/web/image/{att_id}/{name}"
         live.append(m)
-        print(f"{action:8s} id={att_id:<7d} {m['url']}")
+        done += 1
+        print(f"[{done:3d}/{total}] {action:8s} id={att_id:<7d} {m['url']}")
+        if done % 10 == 0:
+            save()                            # so a crash never loses progress
+        if action != "skipped" and args.delay:
+            time.sleep(args.delay)
 
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2, ensure_ascii=False)
+    save()
     write_snippets(live)
     print(f"\n{len(live)} attachments on website {WEBSITE_ID}"
           + (f", {missing} pruned files skipped" if missing else ""))
@@ -305,6 +327,11 @@ def main():
     u = sub.add_parser("upload", help="create the Odoo attachments")
     for flag in ("url", "db", "user", "api-key"):
         u.add_argument(f"--{flag}", required=True)
+    u.add_argument("--delay", type=float, default=0.4,
+                   help="seconds between writes, eases Odoo's rate limit "
+                        "(default 0.4)")
+    u.add_argument("--force", action="store_true",
+                   help="re-upload files that are already on website 14")
     args = ap.parse_args()
     if args.cmd == "convert":
         convert(args.media)
