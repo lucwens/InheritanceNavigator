@@ -17,6 +17,8 @@ The app opens on <http://localhost:8080>. Options: `--port`, `--host`,
 
 1. Drag an MP3 onto the drop zone (or click it to browse). The file name and
    total playing time appear once it is read.
+   Files have to be named `.mp3` and stay under 500 MB; if the browser refuses
+   a file the app now says which of the two rules it broke.
 2. The start time defaults to `00:00:00` and the end time to the end of the
    file. Both fields take `HH:MM:SS`; `MM:SS`, plain seconds and fractions such
    as `00:00:01.5` are accepted too.

@@ -22,7 +22,18 @@ from mp3_slicer import (
     slice_mp3,
 )
 
-MAX_FILE_SIZE = 200 * 1024 * 1024  # 200 MB
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
+MAX_FILE_SIZE_MB = MAX_FILE_SIZE // 1024 // 1024
+
+# Reasons Quasar's uploader can refuse a file before it is even sent.
+REJECTION_REASONS = {
+    "accept": "the file is not an MP3 - its name has to end in .mp3",
+    "max-file-size": f"the file is larger than {MAX_FILE_SIZE_MB} MB",
+    "max-total-size": f"the files are larger than {MAX_FILE_SIZE_MB} MB together",
+    "max-files": "only one file at a time - clear the list first",
+    "duplicate": "that file is already in the list",
+    "filter": "the file was filtered out",
+}
 
 
 @dataclass
@@ -58,11 +69,10 @@ def main_page() -> None:
             max_files=1,
             max_file_size=MAX_FILE_SIZE,
             on_upload=lambda e: load_file(e),
-            on_rejected=lambda _: ui.notify(
-                f"File rejected - only one MP3 up to {MAX_FILE_SIZE // 1024 // 1024} MB is accepted.",
-                type="negative",
-            ),
-        ).props('accept=".mp3,audio/mpeg" flat bordered').classes("w-full")
+        ).props('accept=".mp3,audio/mpeg,audio/mp3" flat bordered').classes("w-full")
+        # NiceGUI's own on_rejected drops the payload, so listen to Quasar directly
+        # to learn which check failed.
+        upload.on("rejected", lambda e: report_rejection(e), args=None)
 
         file_label = ui.label("No file loaded yet.").classes("text-sm text-gray-500")
 
@@ -81,6 +91,20 @@ def main_page() -> None:
 
         audio_preview = ui.audio("").classes("w-full")
         audio_preview.set_visibility(False)
+
+    def report_rejection(event: events.GenericEventArguments) -> None:
+        # Quasar sends a list of {failedPropValidation, file} entries; depending on
+        # the NiceGUI version it arrives as that list or wrapped in another one.
+        raw = event.args if isinstance(event.args, list) else [event.args]
+        entries = [item for entry in raw for item in (entry if isinstance(entry, list) else [entry])]
+        reasons = {
+            REJECTION_REASONS.get(entry.get("failedPropValidation", ""), "the file was rejected")
+            for entry in entries
+            if isinstance(entry, dict)
+        }
+        detail = " and ".join(sorted(reasons)) or "the file was rejected"
+        ui.notify(f"Cannot use this file: {detail}.", type="negative", timeout=8000)
+        upload.reset()
 
     async def load_file(event: events.UploadEventArguments) -> None:
         name = event.file.name
