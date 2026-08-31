@@ -1,15 +1,23 @@
 """Pure-Python MP3 frame parsing and lossless trimming.
 
-The module walks the MPEG audio frame headers of an MP3 file so a section can be
-cut out on exact frame boundaries.  No re-encoding and no external tools
-(ffmpeg, pydub, ...) are required.
+The module walks the MPEG audio frame headers of an MP3 so a section can be cut
+out on exact frame boundaries.  No re-encoding and no external tools (ffmpeg,
+pydub, ...) are required.
+
+Everything works on streams and never holds more than one chunk in memory, so
+files of any size can be scanned and trimmed.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from io import BytesIO
+from pathlib import Path
+from typing import BinaryIO, Iterator, List, Optional
+
+CHUNK_SIZE = 1 << 20        # 1 MB read size
+MAX_FRAME_SIZE = 4096       # every MPEG audio frame is far smaller than this
 
 # Bitrate tables in kbit/s.  Index 0 (free format) and 15 (invalid) are None.
 _BITRATES = {
@@ -41,7 +49,7 @@ class Mp3Error(ValueError):
 
 @dataclass(frozen=True)
 class Frame:
-    """One MPEG audio frame inside the source buffer."""
+    """One MPEG audio frame inside the source."""
 
     offset: int
     length: int
@@ -55,6 +63,35 @@ class Frame:
         return self.start + self.duration
 
 
+@dataclass(frozen=True)
+class Summary:
+    """What a full scan of an MP3 tells us about it."""
+
+    duration: float
+    frames: int
+    tag_size: int            # bytes of leading ID3v2 tag
+
+
+@dataclass(frozen=True)
+class Section:
+    """The part that was actually written out."""
+
+    start: float
+    end: float
+    size: int                # bytes written
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+
+@dataclass(frozen=True)
+class Slice(Section):
+    """A section that was cut in memory, including its bytes."""
+
+    data: bytes = b""
+
+
 def _syncsafe(data: bytes) -> int:
     value = 0
     for byte in data:
@@ -62,13 +99,12 @@ def _syncsafe(data: bytes) -> int:
     return value
 
 
-def id3v2_size(data: bytes) -> int:
+def id3v2_size(header: bytes) -> int:
     """Length of a leading ID3v2 tag, or 0 when there is none."""
-    if len(data) < 10 or data[:3] != b"ID3":
+    if len(header) < 10 or header[:3] != b"ID3":
         return 0
-    flags = data[5]
-    size = 10 + _syncsafe(data[6:10])
-    if flags & 0x10:  # footer present
+    size = 10 + _syncsafe(header[6:10])
+    if header[5] & 0x10:  # footer present
         size += 10
     return size
 
@@ -77,8 +113,8 @@ def _parse_header(data: bytes, pos: int) -> Optional[Frame]:
     """Decode a frame header at ``pos`` or return None when it is not valid."""
     if pos + 4 > len(data):
         return None
-    h0, h1, h2, h3 = data[pos], data[pos + 1], data[pos + 2], data[pos + 3]
-    if h0 != 0xFF or (h1 & 0xE0) != 0xE0:
+    h1, h2 = data[pos + 1], data[pos + 2]
+    if data[pos] != 0xFF or (h1 & 0xE0) != 0xE0:
         return None
 
     version_bits = (h1 >> 3) & 0x03
@@ -122,66 +158,140 @@ def _parse_header(data: bytes, pos: int) -> Optional[Frame]:
     )
 
 
-def _is_info_frame(data: bytes, frame: Frame) -> bool:
+def _is_info_frame(chunk: bytes) -> bool:
     """True for a Xing/Info/VBRI header frame (metadata, not audible audio)."""
-    chunk = data[frame.offset:frame.offset + frame.length]
     return b"Xing" in chunk[:40] or b"Info" in chunk[:40] or chunk[36:40] == b"VBRI"
 
 
-def parse_frames(data: bytes) -> List[Frame]:
-    """Return every audio frame of ``data``, in order, with cumulative times."""
-    pos = id3v2_size(data)
-    frames: List[Frame] = []
-    elapsed = 0.0
-    size = len(data)
+def read_tag_size(stream: BinaryIO) -> int:
+    """Read the ID3v2 tag length from the start of ``stream`` and rewind."""
+    stream.seek(0)
+    size = id3v2_size(stream.read(10))
+    stream.seek(0)
+    return size
 
-    while pos < size - 3:
-        frame = _parse_header(data, pos)
+
+def iter_frames(stream: BinaryIO, *, chunk_size: int = CHUNK_SIZE) -> Iterator[Frame]:
+    """Yield every audio frame of ``stream`` in order, one chunk at a time.
+
+    The frame data itself is not kept, so memory use stays flat no matter how
+    long the file is.  ``Frame.offset`` is absolute within the stream.
+    """
+    for frame, _ in _iter_frames(stream, chunk_size=chunk_size, with_data=False):
+        yield frame
+
+
+def iter_frames_with_data(stream: BinaryIO,
+                          *,
+                          chunk_size: int = CHUNK_SIZE) -> Iterator[tuple[Frame, bytes]]:
+    """Like :func:`iter_frames`, but also yields the bytes of each frame.
+
+    Copying frames has to go through this: seeking the stream while
+    :func:`iter_frames` is reading from it would corrupt its own buffer.
+    """
+    yield from _iter_frames(stream, chunk_size=chunk_size, with_data=True)
+
+
+def _iter_frames(stream: BinaryIO,
+                 *,
+                 chunk_size: int,
+                 with_data: bool) -> Iterator[tuple[Frame, bytes]]:
+    tag_size = read_tag_size(stream)
+    stream.seek(tag_size)
+
+    buffer = b""
+    base = tag_size     # absolute offset of buffer[0]
+    pos = 0             # index into buffer
+    elapsed = 0.0
+    eof = False
+    started = False
+
+    while True:
+        # Keep at least one whole frame in the buffer while there is more to read.
+        # This has to loop: a chunk can be smaller than a frame.
+        while not eof and len(buffer) - pos < MAX_FRAME_SIZE:
+            chunk = stream.read(chunk_size)
+            if chunk:
+                buffer = buffer[pos:] + chunk
+                base += pos
+                pos = 0
+            else:
+                eof = True
+        if pos >= len(buffer):
+            return
+
+        frame = _parse_header(buffer, pos)
         if frame is None:
-            # Not a frame here: jump to the next possible sync word.
-            nxt = data.find(b"\xff", pos + 1)
+            nxt = buffer.find(b"\xff", pos + 1)
             if nxt == -1:
-                break
+                if eof:
+                    return
+                base += len(buffer)
+                buffer, pos = b"", 0
+                continue
             pos = nxt
             continue
 
-        if not frames:
-            # Require a second valid frame right after so that random 0xFF bytes
-            # in a tag are not mistaken for the start of the audio.
-            follower = _parse_header(data, pos + frame.length)
-            if follower is None and pos + frame.length < size - 3:
-                nxt = data.find(b"\xff", pos + 1)
+        if not started:
+            # Require a second valid frame right after, so that a stray 0xFF byte
+            # inside a tag is not mistaken for the start of the audio.
+            follower = _parse_header(buffer, pos + frame.length)
+            if follower is None and not (eof and pos + frame.length >= len(buffer)):
+                nxt = buffer.find(b"\xff", pos + 1)
                 if nxt == -1:
-                    break
+                    if eof:
+                        return
+                    base += len(buffer)
+                    buffer, pos = b"", 0
+                    continue
                 pos = nxt
                 continue
+            if _is_info_frame(buffer[pos:pos + frame.length]):
+                pos += frame.length  # skip the VBR header frame
+                continue
 
-        if not frames and _is_info_frame(data, frame):
-            pos += frame.length  # skip the VBR header frame
-            continue
-
-        frames.append(
+        started = True
+        yield (
             Frame(
-                offset=frame.offset,
+                offset=base + pos,
                 length=frame.length,
                 duration=frame.duration,
                 start=elapsed,
                 bitrate=frame.bitrate,
                 sample_rate=frame.sample_rate,
-            )
+            ),
+            buffer[pos:pos + frame.length] if with_data else b"",
         )
         elapsed += frame.duration
         pos += frame.length
 
-    return frames
+
+def scan(stream: BinaryIO, *, chunk_size: int = CHUNK_SIZE) -> Summary:
+    """Walk the whole stream and report its playing time and frame count."""
+    frames = 0
+    elapsed = 0.0
+    for frame in iter_frames(stream, chunk_size=chunk_size):
+        frames += 1
+        elapsed = frame.end
+    if not frames:
+        raise Mp3Error("No MPEG audio frames found - is this really an MP3 file?")
+    return Summary(duration=elapsed, frames=frames, tag_size=read_tag_size(stream))
+
+
+def scan_file(path: str | Path, *, chunk_size: int = CHUNK_SIZE) -> Summary:
+    """Playing time and frame count of an MP3 on disk."""
+    with open(path, "rb") as stream:
+        return scan(stream, chunk_size=chunk_size)
+
+
+def parse_frames(data: bytes) -> List[Frame]:
+    """Every audio frame of an in-memory MP3."""
+    return list(iter_frames(BytesIO(data)))
 
 
 def duration(data: bytes) -> float:
-    """Playing time of the MP3 in seconds."""
-    frames = parse_frames(data)
-    if not frames:
-        raise Mp3Error("No MPEG audio frames found - is this really an MP3 file?")
-    return frames[-1].end
+    """Playing time of an in-memory MP3, in seconds."""
+    return scan(BytesIO(data)).duration
 
 
 def parse_timecode(text: str) -> float:
@@ -207,48 +317,83 @@ def format_timecode(seconds: float) -> str:
     return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
-@dataclass(frozen=True)
-class Slice:
-    """The trimmed MP3 plus the exact section that was cut."""
-
-    data: bytes
-    start: float
-    end: float
-
-    @property
-    def duration(self) -> float:
-        return self.end - self.start
-
-
-def slice_mp3(data: bytes, start: float, end: float, keep_tags: bool = True) -> Slice:
-    """Cut ``data`` between ``start`` and ``end`` (seconds) on frame boundaries."""
+def _check_range(start: float, end: float) -> None:
     if start < 0:
         raise ValueError("Start time cannot be negative")
     if end <= start:
         raise ValueError("End time must be later than the start time")
 
-    frames = parse_frames(data)
-    if not frames:
-        raise Mp3Error("No MPEG audio frames found - is this really an MP3 file?")
 
-    total = frames[-1].end
-    if start >= total:
-        raise ValueError(f"Start time is past the end of the file ({format_timecode(total)})")
+def slice_stream(source: BinaryIO,
+                 target: BinaryIO,
+                 start: float,
+                 end: float,
+                 *,
+                 keep_tags: bool = True,
+                 chunk_size: int = CHUNK_SIZE) -> Section:
+    """Copy the frames of ``source`` between ``start`` and ``end`` into ``target``.
 
-    # Keep every frame that overlaps the requested window.
-    selected = [f for f in frames if f.end > start and f.start < end]
-    if not selected:
-        raise ValueError("The selected range does not contain any audio")
+    Frames are copied verbatim, so the audio is never re-encoded.  Every frame
+    that overlaps the window is kept, which is why the returned section can be
+    slightly wider than the times asked for.
+    """
+    _check_range(start, end)
 
-    chunks = []
+    written = 0
     if keep_tags:
-        tag = id3v2_size(data)
-        if tag:
-            chunks.append(data[:tag])
-    for frame in selected:
-        chunks.append(data[frame.offset:frame.offset + frame.length])
+        tag_size = read_tag_size(source)
+        if tag_size:
+            source.seek(0)
+            remaining = tag_size
+            while remaining > 0:
+                chunk = source.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+                target.write(chunk)
+                written += len(chunk)
+                remaining -= len(chunk)
 
-    return Slice(data=b"".join(chunks), start=selected[0].start, end=selected[-1].end)
+    first: Optional[Frame] = None
+    last: Optional[Frame] = None
+    total = 0.0
+    for frame, payload in iter_frames_with_data(source, chunk_size=chunk_size):
+        total = frame.end
+        if frame.end <= start:
+            continue
+        if frame.start >= end:
+            break
+        target.write(payload)
+        written += frame.length
+        if first is None:
+            first = frame
+        last = frame
+
+    if total == 0.0:
+        raise Mp3Error("No MPEG audio frames found - is this really an MP3 file?")
+    if first is None or last is None:
+        raise ValueError(
+            f"The selected range holds no audio, the file is {format_timecode(total)} long"
+        )
+    return Section(start=first.start, end=last.end, size=written)
+
+
+def slice_file(source: str | Path,
+               target: str | Path,
+               start: float,
+               end: float,
+               *,
+               keep_tags: bool = True,
+               chunk_size: int = CHUNK_SIZE) -> Section:
+    """Trim an MP3 on disk into another file on disk."""
+    with open(source, "rb") as src, open(target, "wb") as dst:
+        return slice_stream(src, dst, start, end, keep_tags=keep_tags, chunk_size=chunk_size)
+
+
+def slice_mp3(data: bytes, start: float, end: float, *, keep_tags: bool = True) -> Slice:
+    """Trim an in-memory MP3 and return the result together with its bytes."""
+    target = BytesIO()
+    section = slice_stream(BytesIO(data), target, start, end, keep_tags=keep_tags)
+    return Slice(start=section.start, end=section.end, size=section.size, data=target.getvalue())
 
 
 def _main() -> int:
@@ -261,16 +406,12 @@ def _main() -> int:
     parser.add_argument("end", help="end time as 00:00:00")
     args = parser.parse_args()
 
-    with open(args.source, "rb") as handle:
-        data = handle.read()
-
-    result = slice_mp3(data, parse_timecode(args.start), parse_timecode(args.end))
-    with open(args.destination, "wb") as handle:
-        handle.write(result.data)
-
+    section = slice_file(
+        args.source, args.destination, parse_timecode(args.start), parse_timecode(args.end)
+    )
     print(
-        f"Wrote {args.destination}: {format_timecode(result.start)} - "
-        f"{format_timecode(result.end)} ({result.duration:.2f} s)"
+        f"Wrote {args.destination}: {format_timecode(section.start)} - "
+        f"{format_timecode(section.end)} ({section.duration:.2f} s, {section.size} bytes)"
     )
     return 0
 

@@ -2,51 +2,68 @@
 
 Run with:  python app.py
 Then open http://localhost:8080 in a browser.
+
+Uploads are streamed to a temporary file and trimmed straight from there, so
+the size of the MP3 is not limited by the memory of the machine.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from nicegui import events, ui
+from nicegui import app, events, run, ui
 
 from mp3_slicer import (
     Mp3Error,
+    Summary,
     format_timecode,
-    duration as mp3_duration,
     parse_timecode,
-    slice_mp3,
+    scan_file,
+    slice_file,
 )
 
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
-MAX_FILE_SIZE_MB = MAX_FILE_SIZE // 1024 // 1024
-
-# Reasons Quasar's uploader can refuse a file before it is even sent.
+# Quasar refuses files before they are even sent; these are the checks it makes.
 REJECTION_REASONS = {
     "accept": "the file is not an MP3 - its name has to end in .mp3",
-    "max-file-size": f"the file is larger than {MAX_FILE_SIZE_MB} MB",
-    "max-total-size": f"the files are larger than {MAX_FILE_SIZE_MB} MB together",
+    "max-file-size": "the file is too large",
+    "max-total-size": "the files are too large together",
     "max-files": "only one file at a time - clear the list first",
     "duplicate": "that file is already in the list",
     "filter": "the file was filtered out",
 }
 
 
+def format_size(num_bytes: int) -> str:
+    """Human readable file size."""
+    size = float(num_bytes)
+    for unit in ("B", "kB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit in ("B", "kB") else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
 @dataclass
 class Session:
     """Everything the page knows about the file the user dropped."""
 
+    workdir: Path
     name: str = ""
-    data: bytes = field(default=b"", repr=False)
-    length: float = 0.0
+    source: Optional[Path] = None
+    summary: Optional[Summary] = field(default=None, repr=False)
 
     @property
     def loaded(self) -> bool:
-        return bool(self.data)
+        return self.source is not None and self.summary is not None
+
+    @property
+    def length(self) -> float:
+        return self.summary.duration if self.summary else 0.0
 
     @property
     def trimmed_name(self) -> str:
@@ -56,7 +73,8 @@ class Session:
 
 @ui.page("/")
 def main_page() -> None:
-    session = Session()
+    session = Session(workdir=Path(tempfile.mkdtemp(prefix="mp3_trimmer_")))
+    ui.context.client.on_disconnect(lambda: shutil.rmtree(session.workdir, ignore_errors=True))
 
     with ui.column().classes("w-full max-w-2xl mx-auto p-6 gap-4"):
         ui.label("MP3 Trimmer").classes("text-3xl font-bold")
@@ -67,14 +85,16 @@ def main_page() -> None:
             label="Drop your MP3 here or click to browse",
             auto_upload=True,
             max_files=1,
-            max_file_size=MAX_FILE_SIZE,
             on_upload=lambda e: load_file(e),
         ).props('accept=".mp3,audio/mpeg,audio/mp3" flat bordered').classes("w-full")
         # NiceGUI's own on_rejected drops the payload, so listen to Quasar directly
         # to learn which check failed.
         upload.on("rejected", lambda e: report_rejection(e), args=None)
 
-        file_label = ui.label("No file loaded yet.").classes("text-sm text-gray-500")
+        with ui.row().classes("items-center gap-2"):
+            spinner = ui.spinner(size="sm")
+            spinner.set_visibility(False)
+            file_label = ui.label("No file loaded yet.").classes("text-sm text-gray-500")
 
         with ui.card().classes("w-full") as editor:
             ui.label("Select the part to keep").classes("text-lg font-medium")
@@ -84,7 +104,8 @@ def main_page() -> None:
                 end_input = ui.input("End (00:00:00)", value="00:00:00") \
                     .props("mask='##:##:##' outlined").classes("flex-1")
             with ui.row().classes("gap-2"):
-                ui.button("Save trimmed MP3", icon="content_cut", on_click=lambda: trim())
+                trim_button = ui.button("Save trimmed MP3", icon="content_cut",
+                                        on_click=lambda: trim())
                 ui.button("Reset times", on_click=lambda: reset_times()).props("flat")
             result_label = ui.label("").classes("text-sm text-gray-600")
         editor.set_visibility(False)
@@ -108,25 +129,32 @@ def main_page() -> None:
 
     async def load_file(event: events.UploadEventArguments) -> None:
         name = event.file.name
-        data = await event.file.read()
+        source = session.workdir / "source.mp3"
+        spinner.set_visibility(True)
+        file_label.set_text(f"Reading {name} ...")
         try:
-            length = mp3_duration(data)
+            await event.file.save(source)  # streamed, never held in memory
+            summary = await run.cpu_bound(scan_file, source)
         except Mp3Error as error:
-            session.name, session.data, session.length = "", b"", 0.0
+            session.name, session.source, session.summary = "", None, None
             editor.set_visibility(False)
             audio_preview.set_visibility(False)
             file_label.set_text(f"Could not read {name}: {error}")
-            ui.notify(str(error), type="negative")
+            ui.notify(str(error), type="negative", timeout=8000)
             return
+        finally:
+            spinner.set_visibility(False)
+            upload.reset()
 
-        session.name, session.data, session.length = name, data, length
+        session.name, session.source, session.summary = name, source, summary
         file_label.set_text(
-            f"{name} - {format_timecode(length)} ({len(data) / 1024 / 1024:.1f} MB)"
+            f"{name} - {format_timecode(summary.duration)} "
+            f"({format_size(source.stat().st_size)}, {summary.frames} frames)"
         )
         reset_times()
         editor.set_visibility(True)
         result_label.set_text("")
-        upload.reset()
+        audio_preview.set_visibility(False)
 
     def reset_times() -> None:
         start_input.value = "00:00:00"
@@ -149,7 +177,7 @@ def main_page() -> None:
             return None
         return start, end
 
-    def trim() -> None:
+    async def trim() -> None:
         if not session.loaded:
             ui.notify("Drop an MP3 file first.", type="warning")
             return
@@ -157,32 +185,41 @@ def main_page() -> None:
         if times is None:
             return
 
+        target = session.workdir / session.trimmed_name
+        trim_button.disable()
+        spinner.set_visibility(True)
         try:
-            result = slice_mp3(session.data, *times)
+            section = await run.cpu_bound(slice_file, session.source, target, *times)
         except (ValueError, Mp3Error) as error:
-            ui.notify(str(error), type="negative")
+            ui.notify(str(error), type="negative", timeout=8000)
             return
+        finally:
+            trim_button.enable()
+            spinner.set_visibility(False)
 
-        audio_preview.set_source(
-            "data:audio/mpeg;base64," + base64.b64encode(result.data).decode()
-        )
+        # Serve the result from disk, so even a long excerpt is streamed, not
+        # squeezed through a data URL.
+        audio_preview.set_source(app.add_media_file(local_file=target))
         audio_preview.set_visibility(True)
         result_label.set_text(
-            f"Saved {session.trimmed_name}: {format_timecode(result.start)} - "
-            f"{format_timecode(result.end)} ({result.duration:.2f} s, "
-            f"{len(result.data) / 1024:.0f} kB)"
+            f"Saved {session.trimmed_name}: {format_timecode(section.start)} - "
+            f"{format_timecode(section.end)} ({section.duration:.2f} s, "
+            f"{format_size(section.size)})"
         )
-        ui.download.content(result.data, session.trimmed_name, "audio/mpeg")
+        ui.download.file(target, session.trimmed_name, "audio/mpeg")
         ui.notify(f"Saved {session.trimmed_name}", type="positive")
 
 
-def run() -> None:
+def run_app() -> None:
     parser = argparse.ArgumentParser(description="NiceGUI MP3 trimmer.")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--no-browser", action="store_true", help="do not open a browser window")
     args = parser.parse_args()
 
+    # Same worker start method everywhere (it is already the default on Windows),
+    # so behaviour does not depend on the platform.
+    run.process_pool_start_method = "spawn"
     ui.run(
         host=args.host,
         port=args.port,
@@ -192,5 +229,7 @@ def run() -> None:
     )
 
 
-if __name__ in {"__main__", "__mp_main__"}:
-    run()
+if __name__ == "__main__":
+    # Deliberately not "__mp_main__": run.cpu_bound spawns worker processes that
+    # import this module, and they must not start a second server.
+    run_app()

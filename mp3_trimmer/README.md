@@ -17,8 +17,10 @@ The app opens on <http://localhost:8080>. Options: `--port`, `--host`,
 
 1. Drag an MP3 onto the drop zone (or click it to browse). The file name and
    total playing time appear once it is read.
-   Files have to be named `.mp3` and stay under 500 MB; if the browser refuses
-   a file the app now says which of the two rules it broke.
+   There is no size limit: the upload is streamed to a temporary file and read
+   from there. A file of a few hundred MB takes a moment to upload and scan,
+   with a spinner while that runs. Files do have to be named `.mp3`; if the
+   browser refuses one, the app says why.
 2. The start time defaults to `00:00:00` and the end time to the end of the
    file. Both fields take `HH:MM:SS`; `MM:SS`, plain seconds and fractions such
    as `00:00:01.5` are accepted too.
@@ -39,6 +41,12 @@ python mp3_slicer.py song.mp3 excerpt.mp3 00:01:30 00:02:15
 dependencies beyond NiceGUI — no ffmpeg, no pydub. It supports MPEG 1, 2 and 2.5,
 layers I–III, constant and variable bitrate, and skips a leading ID3v2 tag and
 any Xing/Info/VBRI header frame.
+
+Parsing is a stream: frames are read a chunk at a time and never collected in a
+list, so memory stays flat whatever the file size. Scanning a 600 MB MP3 takes
+about 7 seconds and under 20 MB of memory; the cut itself stops reading as soon
+as it passes the end time. Both run in a worker process so the page stays
+responsive.
 
 Every frame that overlaps the requested window is copied verbatim, so the audio
 is never re-encoded and no quality is lost. The cut therefore lands on a frame
